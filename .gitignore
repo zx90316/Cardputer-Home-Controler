@@ -1,0 +1,13 @@
+.venv/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+.coverage
+htmlcov/
+.secrets/
+probe-report.json
+.pio/
+.platformio/
+firmware/.pio/
+firmware/.vscode/
+firmware/build/

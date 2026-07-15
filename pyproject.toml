@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cardputer-home-probe"
+version = "0.1.0"
+description = "LAN capability probe for Tapo L530E and Dyson TP09"
+requires-python = ">=3.11"
+dependencies = [
+  "python-kasa==0.10.2",
+  "libdyson-rest==0.15.0",
+  "paho-mqtt==2.1.0",
+  "zeroconf==0.150.0",
+  "ifaddr==0.2.0",
+]
+
+[project.scripts]
+cardputer-probe = "cardputer_probe.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+pythonpath = ["src"]
