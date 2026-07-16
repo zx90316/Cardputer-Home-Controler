@@ -1,0 +1,53 @@
+name: Feature request / 功能提案
+description: Propose a focused local-first improvement / 提出範圍明確且本地優先的改善
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The project intentionally excludes mandatory Home Assistant, always-on servers, daily cloud control, OTA, remote APIs, scenes, schedules, and cross-VLAN routing. Explain how the proposal preserves local operation and secret safety.
+
+        本專案刻意不加入強制 Home Assistant、always-on server、日常雲端、OTA、遠端 API、場景、排程與跨 VLAN routing。請說明提案如何維持 local-only 與敏感資料安全。
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / 問題
+      description: Describe the user problem rather than only the desired implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior / 建議行為
+      description: Include controls, confirmation semantics, offline behavior, and UI impact.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered / 已考慮方案
+    validations:
+      required: true
+  - type: textarea
+    id: protocol
+    attributes:
+      label: Protocol or hardware evidence / 協定或硬體證據
+      description: For device work, include model, revision, firmware, transport, discovery, and licensed public references.
+  - type: textarea
+    id: risks
+    attributes:
+      label: Security, compatibility, and rollback / 安全、相容與回復
+      description: Explain credential handling, migration, failure modes, and rollback.
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope confirmation / 範圍確認
+      options:
+        - label: The proposal works locally during normal operation. / 日常運作可維持本地控制。
+          required: true
+        - label: The proposal does not require hard-coded device IPs. / 不需要寫死設備 IP。
+          required: true
+        - label: I searched existing issues and documentation. / 我已搜尋既有 issue 與文件。
+          required: true

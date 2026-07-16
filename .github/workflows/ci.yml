@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python probe tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install pinned dependencies
+        run: python -m pip install --requirement requirements.txt
+
+      - name: Run Python tests
+        run: python -m pytest -q
+
+  firmware:
+    name: Cardputer firmware
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: firmware/requirements.txt
+
+      - name: Create build environment
+        shell: pwsh
+        run: |
+          python -m venv .venv
+          .\.venv\Scripts\python.exe -m pip install --requirement .\firmware\requirements.txt
+
+      - name: Build firmware
+        shell: pwsh
+        run: powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\scripts\build-firmware.ps1
+
+      - name: Upload reproducible firmware artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: cardputer-home-controller-${{ github.sha }}
+          path: |
+            firmware/build/cardputer-home-controller-app.bin
+            firmware/build/cardputer-home-controller-complete.bin
+            firmware/build/firmware-manifest.json
+          if-no-files-found: error
+          retention-days: 14
+
+  native:
+    name: Native C++ tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: firmware/requirements.txt
+
+      - name: Install PlatformIO
+        run: python -m pip install --requirement firmware/requirements.txt
+
+      - name: Run native tests
+        run: pio test -d firmware -e native

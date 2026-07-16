@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation / 專案文件
+    url: https://github.com/zx90316/Cardputer-Home-Controler#readme
+    about: Read setup, controls, diagnostics, and known boundaries before opening an issue.
+  - name: Support guide / 支援指南
+    url: https://github.com/zx90316/Cardputer-Home-Controler/blob/master/SUPPORT.md
+    about: Review required diagnostics and sensitive-data rules.
+  - name: Security policy / 安全政策
+    url: https://github.com/zx90316/Cardputer-Home-Controler/security/policy
+    about: Never disclose credentials or exploitable vulnerabilities in a public issue.

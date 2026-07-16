@@ -1,0 +1,62 @@
+name: Hardware compatibility / 硬體相容性
+description: Submit evidence for a model, revision, or firmware variant / 提交型號、版本或 firmware 變體證據
+title: "[Hardware]: "
+labels:
+  - hardware
+body:
+  - type: input
+    id: controller
+    attributes:
+      label: Controller and project version / 控制器與專案版本
+      placeholder: Cardputer Adv, 1.0.0-rc3
+    validations:
+      required: true
+  - type: input
+    id: device
+    attributes:
+      label: Device identity / 設備資訊
+      description: Model and full suffix; do not include a unique serial number.
+      placeholder: Taiwan Sanyo RG57A..., Dyson TP09 438K, Tapo L530E...
+    validations:
+      required: true
+  - type: textarea
+    id: revisions
+    attributes:
+      label: Revisions / 版本
+      placeholder: |
+        Hardware revision:
+        Device firmware:
+        Region:
+        App compatibility setting:
+    validations:
+      required: true
+  - type: dropdown
+    id: transport
+    attributes:
+      label: Transport / 傳輸方式
+      options:
+        - Infrared
+        - Local MQTT
+        - KLAP
+        - Other local LAN protocol
+    validations:
+      required: true
+  - type: textarea
+    id: results
+    attributes:
+      label: Tested operations and results / 測試項目與結果
+      description: List every tested control, readback, restore, offline, and recovery result.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Redacted evidence / 遮蔽後證據
+      description: Probe stage/code, protocol vectors, photos, or sanitized logs. Never include credentials or serial numbers.
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy confirmation / 隱私確認
+      options:
+        - label: I removed credentials, unique serial numbers, MAC addresses, and private network information. / 已移除 credential、唯一 serial、MAC 與私人網路資訊。
+          required: true

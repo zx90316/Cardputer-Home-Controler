@@ -1,0 +1,92 @@
+name: Bug report / 錯誤回報
+description: Report a reproducible firmware or probe defect / 回報可重現的韌體或 probe 問題
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve the project. Do not include passwords, OTPs, MQTT credentials, setup AP passwords, cookies, private packet captures, or `.secrets/` content.
+
+        感謝協助改善專案。禁止附上密碼、OTP、MQTT credential、設定 AP 密碼、cookie、私人 packet capture 或 `.secrets/` 內容。
+  - type: input
+    id: version
+    attributes:
+      label: Project version / 專案版本
+      description: VERSION value, release tag, or commit SHA.
+      placeholder: 1.0.0-rc3 / abc1234
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected component / 受影響元件
+      options:
+        - Cardputer UI / keyboard
+        - RG57A infrared
+        - Dyson TP09 MQTT
+        - Tapo L530E KLAP or discovery
+        - Setup portal / NVS
+        - Python probe
+        - Build / CI / documentation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Hardware and network environment / 硬體與網路環境
+      description: Include device model, hardware/firmware revision, router/AP, topology, and relevant isolation settings. Redact private data.
+      placeholder: |
+        Cardputer Adv:
+        Target device and firmware:
+        Router/AP:
+        Same LAN / guest / mesh / VLAN:
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps / 重現步驟
+      placeholder: |
+        1. Open ...
+        2. Press ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior / 預期行為
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior / 實際行為
+      description: Include frequency, duration, and whether retry/reboot changes the result.
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Redacted diagnostics / 遮蔽後診斷
+      description: Paste only sanitized serial output, diagnostics, probe stage/code, or manifest hash.
+      render: text
+  - type: textarea
+    id: regression
+    attributes:
+      label: Last known working version / 最後正常版本
+      description: Leave blank if unknown.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Safety checklist / 安全確認
+      options:
+        - label: I searched existing issues and read SUPPORT.md. / 我已搜尋既有 issue 並閱讀 SUPPORT.md。
+          required: true
+        - label: I removed all credentials, OTPs, serial numbers, and private network data. / 我已移除所有敏感資料。
+          required: true
+        - label: This is not a security vulnerability requiring private disclosure. / 這不是需要私下回報的安全漏洞。
+          required: true
