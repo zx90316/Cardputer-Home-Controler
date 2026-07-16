@@ -73,6 +73,7 @@ class TapoAdapter final : public DeviceAdapter {
   String runtimeHost_;
   std::vector<std::unique_ptr<TapoAdapter>> children_;
   uint32_t nextGroupDiscoveryMs_{0};
+  uint32_t groupDiscoveryRetryMs_{1000};
   AdapterHealth health_{};
   struct PendingCommand {
     bool active{false};

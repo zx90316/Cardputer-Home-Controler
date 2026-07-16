@@ -1,5 +1,7 @@
 #include "adapters/TapoAdapter.h"
 
+#include "core/StateReducer.h"
+
 #include <Arduino.h>
 #include <HTTPClient.h>
 #include <WiFi.h>
@@ -141,7 +143,12 @@ bool TapoAdapter::begin(const AppConfig& config) {
   baseConfig_ = config;
   config_ = config.tapo;
   if (config_.username.empty() || config_.password.empty()) return false;
-  if (groupMode_) return refreshGroup(millis());
+  if (groupMode_) {
+    children_.clear();
+    nextGroupDiscoveryMs_ = 0;
+    groupDiscoveryRetryMs_ = 1000;
+    return refreshGroup(millis());
+  }
   if (runtimeHost_.isEmpty()) return false;
   connection_ = ConnectionState::Connecting;
   if (!handshake()) return false;
@@ -327,7 +334,7 @@ bool TapoAdapter::encryptedPost(const String& json, String& plaintext) {
 }
 
 bool TapoAdapter::request(const char* method, JsonObjectConst params, JsonDocument& response, bool retry) {
-  if (connection_ != ConnectionState::Online || millis() >= sessionExpiresMs_) {
+  if (connection_ != ConnectionState::Online || !sessionExpiresMs_ || deadlineReached(millis(), sessionExpiresMs_)) {
     if (!handshake()) return false;
   }
   JsonDocument requestDoc;
@@ -357,6 +364,7 @@ bool TapoAdapter::request(const char* method, JsonObjectConst params, JsonDocume
 
 void TapoAdapter::updateState(JsonObjectConst result) {
   state_.power = result["device_on"] | state_.power;
+  state_.poweredOnDevices = state_.power ? 1 : 0;
   state_.brightness = result["brightness"] | state_.brightness;
   state_.hue = result["hue"] | state_.hue;
   state_.saturation = result["saturation"] | state_.saturation;
@@ -398,12 +406,15 @@ bool TapoAdapter::loadPresets() {
 
 bool TapoAdapter::refreshGroup(uint32_t nowMs) {
   const auto hosts = discoverL530Hosts();
-  nextGroupDiscoveryMs_ = nowMs + (hosts.empty() ? 10000 : 60000);
   if (hosts.empty()) {
+    nextGroupDiscoveryMs_ = nowMs + groupDiscoveryRetryMs_;
+    groupDiscoveryRetryMs_ = nextReconnectDelay(groupDiscoveryRetryMs_);
     setError("no L530E discovered", nowMs);
     updateGroupState();
     return !children_.empty();
   }
+  groupDiscoveryRetryMs_ = 1000;
+  nextGroupDiscoveryMs_ = nowMs + 60000;
 
   std::vector<std::string> current;
   for (const auto& child : children_) current.emplace_back(child->runtimeHost_.c_str());
@@ -443,13 +454,16 @@ void TapoAdapter::updateGroupState() {
       aggregate = item;
       aggregate.totalDevices = total;
       aggregate.onlineDevices = online;
+      aggregate.poweredOnDevices = item.power ? 1 : 0;
       haveFirst = true;
     } else {
-      aggregate.mixed = aggregate.mixed || aggregate.power != item.power ||
-                        aggregate.brightness != item.brightness ||
-                        aggregate.colorTemperature != item.colorTemperature ||
-                        aggregate.hue != item.hue || aggregate.saturation != item.saturation ||
-                        aggregate.effect != item.effect;
+      if (item.power) ++aggregate.poweredOnDevices;
+      if (aggregate.power != item.power) aggregate.mixedFields |= 0x01;
+      if (aggregate.brightness != item.brightness) aggregate.mixedFields |= 0x02;
+      if (aggregate.colorTemperature != item.colorTemperature || aggregate.hue != item.hue ||
+          aggregate.saturation != item.saturation || aggregate.effect != item.effect)
+        aggregate.mixedFields |= 0x04;
+      aggregate.mixed = aggregate.mixedFields != 0;
     }
     aggregate.lastReportMs = max(aggregate.lastReportMs, item.lastReportMs);
   }
@@ -572,17 +586,19 @@ DeviceEvent TapoAdapter::execute(const DeviceCommand& command) {
     DeviceCommand groupCommand = command;
     if (groupCommand.kind == CommandKind::TogglePower) {
       groupCommand.kind = CommandKind::SetPower;
-      groupCommand.value1 = state_.mixed ? 1 : !state_.power;
+      groupCommand.value1 = lightGroupPowerTarget(state_);
     }
     uint8_t accepted = 0;
     uint8_t targets = 0;
     uint8_t completed = 0;
+    uint8_t succeeded = 0;
     uint8_t authFailures = 0;
     for (auto& child : children_) {
       if (child->connectionState() != ConnectionState::Online) continue;
       ++targets;
       const DeviceEvent result = child->execute(groupCommand);
       if (result.result == EventResult::Pending || result.result == EventResult::Succeeded) ++accepted;
+      if (result.result == EventResult::Succeeded) ++succeeded;
       if (result.result == EventResult::AuthFailed) ++authFailures;
       if (result.result != EventResult::Pending) ++completed;
     }
@@ -599,7 +615,7 @@ DeviceEvent TapoAdapter::execute(const DeviceCommand& command) {
       slot->deadlineMs = millis() + 3000;
       slot->targets = targets;
       slot->completed = completed;
-      slot->succeeded = 0;
+      slot->succeeded = succeeded;
       slot->authFailures = authFailures;
       return makeEvent(DeviceId::Light, command.id, EventResult::Pending, message,
                        ConfirmationKind::KlapReadback, 0, targets);

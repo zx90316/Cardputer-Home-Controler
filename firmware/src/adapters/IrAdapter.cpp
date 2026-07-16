@@ -43,8 +43,7 @@ DeviceEvent IrAdapter::execute(const DeviceCommand& command) {
 
   reduceAc(state_, command, millis());
   applyState();
-  const bool oneShotToggle = isMideaOneShotToggle(command.kind);
-  switch (command.kind) {
+  if (isMideaOneShotToggle(command.kind)) switch (command.kind) {
     // These are one-shot Midea toggle frames, not absolute state fields. A true
     // pulse is required on every transition, including the transition to off.
     case CommandKind::ToggleSwing: ac_.setSwingVToggle(true); break;
@@ -52,11 +51,12 @@ DeviceEvent IrAdapter::execute(const DeviceCommand& command) {
     case CommandKind::ToggleClean: ac_.setCleanToggle(true); break;
     case CommandKind::ToggleLed: ac_.setLightToggle(true); break;
     case CommandKind::ToggleTurbo: ac_.setTurboToggle(true); break;
-    case CommandKind::SetAcOnTimer: ac_.setOnTimer(state_.onTimerMinutes); break;
-    case CommandKind::SetAcOffTimer: ac_.setOffTimer(state_.offTimerMinutes); break;
     default: break;
+  } else if (command.kind == CommandKind::SetAcOnTimer) {
+    ac_.setOnTimer(state_.onTimerMinutes);
+  } else if (command.kind == CommandKind::SetAcOffTimer) {
+    ac_.setOffTimer(state_.offTimerMinutes);
   }
-  (void)oneShotToggle;  // Kept explicit for native policy coverage and future special frames.
   ac_.send();
   health_.lastSuccessMs = state_.lastSentMs;
   return makeEvent(DeviceId::Ac, command.id, EventResult::Succeeded, "assumed / last sent",

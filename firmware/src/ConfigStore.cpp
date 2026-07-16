@@ -37,7 +37,7 @@ String encodeConfig(const AppConfig& config) {
 bool decodeConfig(const String& raw, AppConfig& config, uint32_t& foundVersion) {
   JsonDocument doc;
   if (deserializeJson(doc, raw) != DeserializationError::Ok) return false;
-  foundVersion = doc["schema"] | 0;
+  foundVersion = doc["schema"] | 0U;
   if (foundVersion != 1 && foundVersion != kConfigSchemaVersion) return false;
   config.schemaVersion = kConfigSchemaVersion;
   config.wifi.ssid = doc["wifi"]["ssid"] | "";
@@ -61,9 +61,9 @@ SlotValue decodeSlot(const String& raw) {
   if (raw.isEmpty()) return slot;
   JsonDocument envelope;
   if (deserializeJson(envelope, raw) != DeserializationError::Ok || (envelope["storage"] | 0) != 1) return slot;
-  slot.revision = envelope["revision"] | 0;
+  slot.revision = envelope["revision"] | 0U;
   slot.payload = envelope["payload"] | "";
-  const uint32_t expected = envelope["checksum"] | 0;
+  const uint32_t expected = envelope["checksum"] | 0U;
   AppConfig test;
   uint32_t version = 0;
   slot.valid = !slot.payload.isEmpty() && expected == checksum(slot.payload) && decodeConfig(slot.payload, test, version);

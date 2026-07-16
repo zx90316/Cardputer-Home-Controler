@@ -70,4 +70,33 @@ inline bool isMideaOneShotToggle(CommandKind kind) {
          kind == CommandKind::ToggleLed;
 }
 
+inline uint8_t reverseByte(uint8_t value) {
+  uint8_t reversed = 0;
+  for (uint8_t bit = 0; bit < 8; ++bit) reversed = static_cast<uint8_t>((reversed << 1) | ((value >> bit) & 1U));
+  return reversed;
+}
+
+inline uint8_t mideaChecksum(uint64_t state) {
+  uint8_t sum = 0;
+  uint64_t bytes = state;
+  for (uint8_t index = 0; index < 5; ++index) {
+    bytes >>= 8;
+    sum = static_cast<uint8_t>(sum + reverseByte(static_cast<uint8_t>(bytes)));
+  }
+  return reverseByte(static_cast<uint8_t>(0U - sum));
+}
+
+inline bool mideaChecksumValid(uint64_t state) {
+  return static_cast<uint8_t>(state) == mideaChecksum(state);
+}
+
+// Pinned IRremoteESP8266 2.9.0 vector family: power on, cool, low fan,
+// native Celsius. Used to catch regressions that would re-enable Fahrenheit.
+inline uint64_t mideaCoolLowCelsiusVector(uint8_t temperature) {
+  if (temperature < 17) temperature = 17;
+  if (temperature > 30) temperature = 30;
+  uint64_t state = 0xA18840FFFF00ULL | (static_cast<uint64_t>(temperature - 17) << 24);
+  return state | mideaChecksum(state);
+}
+
 }  // namespace chc

@@ -49,6 +49,7 @@ struct DeviceCommand {
   int32_t value2{0};
   int32_t value3{0};
   uint32_t id{0};
+  uint32_t queuedAtMs{0};
 };
 
 struct AcState {
@@ -101,7 +102,9 @@ struct LightState {
   int8_t presetIndex{-1};
   uint8_t onlineDevices{0};
   uint8_t totalDevices{0};
+  uint8_t poweredOnDevices{0};
   bool mixed{false};
+  uint8_t mixedFields{0};  // bit0 power, bit1 brightness, bit2 colour/effect.
   uint32_t lastReportMs{0};
 };
 
@@ -136,6 +139,7 @@ inline DeviceEvent makeEvent(DeviceId device, uint32_t id, EventResult result, c
   event.succeededTargets = succeededTargets;
   event.totalTargets = totalTargets;
   if (text) std::strncpy(event.message, text, sizeof(event.message) - 1);
+  event.message[sizeof(event.message) - 1] = '\0';
   return event;
 }
 

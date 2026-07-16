@@ -9,7 +9,9 @@
 #include "adapters/TapoAdapter.h"
 #include "core/CommandDispatcher.h"
 #include "core/Models.h"
+#include "core/PowerPolicy.h"
 #include "core/ProtocolHelpers.h"
+#include "core/StateReducer.h"
 #include "core/TimeUtils.h"
 
 using namespace chc;
@@ -19,7 +21,9 @@ namespace {
 QueueHandle_t eventQueue;
 SemaphoreHandle_t stateMutex;
 SemaphoreHandle_t commandMutex;
-CommandDispatcher<24> commandDispatcher;
+CommandDispatcher<16> irCommandDispatcher;
+CommandDispatcher<24> networkCommandDispatcher;
+TaskHandle_t irTaskHandle{nullptr};
 AppConfig appConfig;
 ConfigStore configStore;
 SetupPortal setupPortal;
@@ -36,7 +40,11 @@ struct SystemState {
   bool wifiConnected{false};
   int32_t rssi{0};
   char ip[16]{"0.0.0.0"};
+  uint32_t lastIrLatencyMs{0};
+  uint32_t maxIrLatencyMs{0};
 } sharedSystem;
+uint32_t acStateRevision{0};
+uint32_t acSaveDueMs{0};
 volatile DeviceId selectedDevice = DeviceId::Ac;
 uint8_t selectedItem[3]{};
 uint32_t nextCommandId = 1;
@@ -47,7 +55,39 @@ char lastFeedback[48] = "就緒";
 uint16_t feedbackColor = TFT_DARKGREY;
 EventResult lastDeviceResult[3]{EventResult::Succeeded, EventResult::Offline, EventResult::Offline};
 M5Canvas uiCanvas(&M5Cardputer.Display);
-constexpr const char* kFirmwareVersion = "1.0.0-rc1";
+constexpr const char* kFirmwareVersion = "1.0.0-rc3";
+constexpr uint32_t kIrLatencyTargetMs = 50;
+
+struct UiRuntime {
+  int32_t batteryLevel{-1};
+  bool charging{false};
+  bool imuAvailable{false};
+  bool dimmed{false};
+  bool sleeping{false};
+  bool haveMotionSample{false};
+  bool forceRedraw{true};
+  float lastAx{0};
+  float lastAy{0};
+  float lastAz{0};
+  uint32_t lastActivityMs{0};
+  uint32_t nextMotionSampleMs{0};
+  uint32_t nextBatterySampleMs{0};
+} uiRuntime;
+
+constexpr uint8_t kNormalBrightness = 150;
+constexpr uint8_t kDimBrightness = 22;
+constexpr uint32_t kDimAfterMs = 30000;
+constexpr uint32_t kSleepAfterMs = 120000;
+constexpr uint16_t kUiBackground = 0x0863;
+constexpr uint16_t kUiSurface = 0x10C5;
+constexpr uint16_t kUiRaised = 0x1928;
+constexpr uint16_t kUiBorder = 0x29CB;
+constexpr uint16_t kUiMuted = 0x9CF3;
+constexpr uint16_t kUiBlue = 0x2D7F;
+constexpr uint16_t kUiCyan = 0x4E7F;
+constexpr uint16_t kUiAmber = 0xFD20;
+constexpr uint16_t kUiGreen = 0x4E67;
+constexpr uint16_t kUiRed = 0xF9E7;
 
 const char* connectionText(ConnectionState state) {
   switch (state) {
@@ -61,10 +101,12 @@ const char* connectionText(ConnectionState state) {
 }
 
 bool enqueue(DeviceId device, CommandKind kind, int v1 = 0, int v2 = 0, int v3 = 0) {
-  DeviceCommand command{device, kind, v1, v2, v3, nextCommandId++};
+  DeviceCommand command{device, kind, v1, v2, v3, nextCommandId++, millis()};
   xSemaphoreTake(commandMutex, portMAX_DELAY);
-  const bool accepted = commandDispatcher.push(command);
+  const bool accepted = device == DeviceId::Ac ? irCommandDispatcher.push(command) :
+                                                 networkCommandDispatcher.push(command);
   xSemaphoreGive(commandMutex);
+  if (accepted && device == DeviceId::Ac && irTaskHandle) xTaskNotifyGive(irTaskHandle);
   if (!accepted) {
     strncpy(lastFeedback, "命令佇列已滿", sizeof(lastFeedback) - 1);
     feedbackColor = TFT_RED;
@@ -79,7 +121,8 @@ bool enqueue(DeviceId device, CommandKind kind, int v1 = 0, int v2 = 0, int v3 =
 
 bool latestCommand(DeviceId device, CommandKind kind, DeviceCommand& command) {
   xSemaphoreTake(commandMutex, portMAX_DELAY);
-  const bool found = commandDispatcher.latest(device, kind, command);
+  const bool found = device == DeviceId::Ac ? irCommandDispatcher.latest(device, kind, command) :
+                                              networkCommandDispatcher.latest(device, kind, command);
   xSemaphoreGive(commandMutex);
   return found;
 }
@@ -90,11 +133,10 @@ int effectiveValue(DeviceId device, CommandKind kind, int fallback, uint8_t fiel
   return field == 2 ? command.value2 : field == 3 ? command.value3 : command.value1;
 }
 
-int nextTimerValue(int current) {
-  if (current < 30) return 30;
-  if (current < 60) return 60;
-  if (current < 120) return 120;
-  return 0;
+bool effectiveLightGroupPowerTarget(const LightState& light) {
+  DeviceCommand pending;
+  const bool hasPending = latestCommand(DeviceId::Light, CommandKind::SetPower, pending);
+  return nextLightGroupPowerTarget(light, hasPending, hasPending && pending.value1 != 0);
 }
 
 uint8_t deviceIndex(DeviceId device) { return static_cast<uint8_t>(device) - 1; }
@@ -103,6 +145,19 @@ uint8_t itemCount(DeviceId device) {
 }
 const char* onOff(bool value) { return value ? "開" : "關"; }
 String timerText(int minutes) { return minutes > 0 ? String(minutes) + " 分" : "關閉"; }
+
+String mixedLightText(const LightState& light) {
+  if (!light.mixed) return "";
+  String value = "異:";
+  if (light.mixedFields & 0x01) value += "電";
+  if (light.mixedFields & 0x02) value += "亮";
+  if (light.mixedFields & 0x04) value += "色";
+  return value;
+}
+
+String mixedValue(const String& value, bool mixed) {
+  return mixed ? String("混合·") + value : value;
+}
 
 const char* itemLabel(DeviceId device, uint8_t item) {
   static const char* ac[] = {"電源", "溫度", "模式", "風速", "上下擺風", "睡眠", "強力", "節能", "自體清潔", "面板燈", "開機計時", "關機計時"};
@@ -138,26 +193,87 @@ String itemValue(DeviceId device, uint8_t item, const AcState& ac,
   }
   switch (item) {
     case 0: return light.mixed ? "混合" : onOff(light.power);
-    case 1: return String(light.brightness) + "%";
-    case 2: return light.colorTemperature ? String(light.colorTemperature) + " K" : "彩色模式";
-    case 3: return String(light.hue) + "°"; case 4: return String(light.saturation) + "%";
-    case 5: return light.effect == 1 ? "Party" : light.effect == 2 ? "Relax" : "關閉";
-    default: return light.presetIndex >= 0 ? String(light.presetIndex + 1) : "未選";
+    case 1: return mixedValue(String(light.brightness) + "%", light.mixedFields & 0x02);
+    case 2: return mixedValue(light.colorTemperature ? String(light.colorTemperature) + " K" : "彩色模式",
+                              light.mixedFields & 0x04);
+    case 3: return mixedValue(String(light.hue) + "°", light.mixedFields & 0x04);
+    case 4: return mixedValue(String(light.saturation) + "%", light.mixedFields & 0x04);
+    case 5: return mixedValue(light.effect == 1 ? "Party" : light.effect == 2 ? "Relax" : "關閉",
+                              light.mixedFields & 0x04);
+    default: return mixedValue(light.presetIndex >= 0 ? String(light.presetIndex + 1) : "未選",
+                               light.mixedFields & 0x04);
   }
+}
+
+uint16_t connectionColor(ConnectionState state) {
+  if (state == ConnectionState::Online) return kUiGreen;
+  if (state == ConnectionState::Degraded || state == ConnectionState::Connecting) return kUiAmber;
+  return kUiRed;
+}
+
+const char* headerStatusText(ConnectionState state) {
+  switch (state) {
+    case ConnectionState::Online: return "ON";
+    case ConnectionState::Degraded: return "PART";
+    case ConnectionState::Connecting: return "LINK";
+    case ConnectionState::AuthFailed: return "AUTH";
+    case ConnectionState::Offline: return "OFF";
+    default: return "CFG";
+  }
+}
+
+void drawBattery() {
+  auto& display = uiCanvas;
+  const int x = 215;
+  const int y = 6;
+  display.drawRoundRect(x, y, 19, 9, 2, kUiMuted);
+  display.fillRect(x + 19, y + 3, 2, 3, kUiMuted);
+  if (uiRuntime.batteryLevel > 0) {
+    const int fill = constrain(uiRuntime.batteryLevel * 15 / 100, 1, 15);
+    const uint16_t color = uiRuntime.batteryLevel <= 15 ? kUiRed :
+                           uiRuntime.batteryLevel <= 35 ? kUiAmber : kUiGreen;
+    display.fillRoundRect(x + 2, y + 2, fill, 5, 1, color);
+  }
+  display.setFont(&fonts::Font0);
+  display.setTextColor(uiRuntime.charging ? kUiAmber : kUiMuted, kUiBackground);
+  display.setCursor(185, 7);
+  if (uiRuntime.batteryLevel >= 0) display.printf("%s%ld%%", uiRuntime.charging ? "+" : "", static_cast<long>(uiRuntime.batteryLevel));
+  else display.print("--%");
 }
 
 void drawHeader(const char* title, ConnectionState state) {
   auto& display = uiCanvas;
-  display.setFont(&fonts::efontTW_12_b);
-  display.setTextColor(TFT_CYAN, TFT_BLACK);
-  display.setCursor(4, 2); display.print(title);
+  display.fillRect(0, 0, 240, 22, kUiBackground);
+  display.fillRoundRect(3, 5, 3, 12, 1, kUiBlue);
+  display.setFont(&fonts::efontTW_10);
+  display.setTextColor(TFT_WHITE, kUiBackground);
+  display.setCursor(10, 5); display.print(title);
+  const uint16_t statusColor = connectionColor(state);
+  display.fillCircle(151, 10, 3, statusColor);
   display.setFont(&fonts::Font0);
-  const char* status = connectionText(state);
-  const int x = 236 - display.textWidth(status);
-  display.setTextColor(state == ConnectionState::Online ? TFT_GREEN :
-                       state == ConnectionState::Degraded ? TFT_YELLOW : TFT_ORANGE, TFT_BLACK);
-  display.setCursor(x, 7); display.print(status);
-  display.drawFastHLine(0, 20, 240, TFT_DARKGREY);
+  display.setTextColor(kUiMuted, kUiBackground);
+  display.setCursor(157, 7); display.print(headerStatusText(state));
+  drawBattery();
+}
+
+void drawCard(int x, int y, int width, int height, uint16_t accent, bool selected = false) {
+  auto& display = uiCanvas;
+  display.fillRoundRect(x, y, width, height, 5, selected ? kUiRaised : kUiSurface);
+  display.drawRoundRect(x, y, width, height, 5, selected ? accent : kUiBorder);
+  display.fillRoundRect(x, y, 3, height, 2, accent);
+}
+
+void drawFooter(const char* hint) {
+  auto& display = uiCanvas;
+  display.fillRect(0, 111, 240, 24, kUiRaised);
+  display.drawFastHLine(0, 111, 240, kUiBorder);
+  display.setFont(&fonts::efontTW_10);
+  display.setTextColor(feedbackColor, kUiRaised);
+  display.setCursor(5, 112); display.print(lastFeedback);
+  display.setFont(&fonts::Font0);
+  display.setTextColor(kUiMuted, kUiRaised);
+  const int x = max(4, 236 - display.textWidth(hint));
+  display.setCursor(x, 126); display.print(hint);
 }
 
 const char* acModeText(AcMode mode) {
@@ -201,90 +317,113 @@ void drawQuickPage(const AcState& ac, const DysonState& dyson, const LightState&
                    const AdapterHealth& dysonHealth, const AdapterHealth& lightHealth,
                    const SystemState& system) {
   auto& display = uiCanvas;
-  display.fillScreen(TFT_BLACK);
+  display.fillScreen(kUiBackground);
   const ConnectionState connection = !system.wifiConnected ? ConnectionState::Offline :
       (dysonHealth.connection == ConnectionState::Online && lightHealth.connection == ConnectionState::Online) ? ConnectionState::Online :
       (dysonHealth.connection == ConnectionState::Online || lightHealth.connection == ConnectionState::Online) ? ConnectionState::Degraded :
       ConnectionState::Offline;
-  drawHeader("全體快捷", connection);
+  drawHeader("HOME  快速控制", connection);
+
+  drawCard(3, 25, 75, 82, kUiCyan);
   display.setFont(&fonts::efontTW_10);
+  display.setTextColor(kUiCyan, kUiSurface); display.setCursor(9, 29);
+  display.printf("%s 冷氣", resultIcon(lastDeviceResult[0]));
+  display.setFont(&fonts::Font4);
+  display.setTextColor(TFT_WHITE, kUiSurface); display.setCursor(10, 44); display.printf("%u", ac.temperature);
+  display.setFont(&fonts::efontTW_10); display.setCursor(49, 51); display.print("°C");
+  display.setTextColor(ac.power ? kUiGreen : kUiMuted, kUiSurface); display.setCursor(10, 72);
+  display.printf("%s · %s", ac.power ? "ON" : "OFF", acModeText(ac.mode));
+  display.setFont(&fonts::Font0); display.setTextColor(kUiMuted, kUiSurface);
+  display.setCursor(10, 92); display.print("Q  W/E  R");
 
-  display.fillRect(0, 22, 240, 27, 0x0841);
-  display.setTextColor(TFT_CYAN, 0x0841);
-  display.setCursor(4, 23); display.printf("%s 冷氣  Q電源  W− / E＋  R模式", resultIcon(lastDeviceResult[0]));
-  display.setTextColor(TFT_WHITE, 0x0841);
-  display.setCursor(4, 36);
-  display.printf("狀態 %s   %u°C   ", ac.power ? "ON" : "OFF", ac.temperature);
-  display.print(acModeText(ac.mode));
+  drawCard(82, 25, 75, 82, kUiAmber);
+  display.setFont(&fonts::efontTW_10); display.setTextColor(kUiAmber, kUiSurface); display.setCursor(88, 29);
+  display.printf("%s 風扇", resultIcon(lastDeviceResult[1]));
+  display.setFont(&fonts::Font4); display.setTextColor(TFT_WHITE, kUiSurface); display.setCursor(91, 44);
+  display.printf("%u", dyson.speed);
+  display.setFont(&fonts::efontTW_10); display.setCursor(124, 51); display.print("級");
+  display.setTextColor(dyson.power ? kUiGreen : kUiMuted, kUiSurface); display.setCursor(89, 72);
+  display.printf("%s · %s", dyson.power ? "ON" : "OFF", dyson.oscillation ? "擺動" : "固定");
+  display.setFont(&fonts::Font0); display.setTextColor(kUiMuted, kUiSurface);
+  display.setCursor(89, 92); display.print("A S/D F G/H");
 
-  display.fillRect(0, 50, 240, 29, 0x1002);
-  display.setTextColor(TFT_ORANGE, 0x1002);
-  display.setCursor(4, 51); display.printf("%s 風扇  A電源  S− / D＋  F擺動", resultIcon(lastDeviceResult[1]));
-  display.setTextColor(TFT_WHITE, 0x1002);
-  display.setCursor(4, 64);
-  display.printf("G/H角度  %s %u級 %u–%u° ", dyson.power ? "ON" : "OFF", dyson.speed,
-                 dyson.angleLow, dyson.angleHigh);
-  display.print(dyson.oscillation ? "擺動" : "固定");
+  drawCard(161, 25, 76, 82, lightPreviewColor(light));
+  display.setFont(&fonts::efontTW_10); display.setTextColor(kUiGreen, kUiSurface); display.setCursor(167, 29);
+  display.printf("%s 燈具%s", resultIcon(lastDeviceResult[2]), light.mixed ? "·MIX" : "");
+  display.setFont(&fonts::Font4); display.setTextColor(TFT_WHITE, kUiSurface); display.setCursor(168, 44);
+  display.printf("%u", light.brightness);
+  display.setFont(&fonts::efontTW_10); display.setCursor(225, 51); display.print("%");
+  display.setTextColor(light.poweredOnDevices ? kUiGreen : kUiMuted, kUiSurface); display.setCursor(168, 72);
+  display.printf("%u/%u 開啟", light.poweredOnDevices, light.onlineDevices);
+  display.setFont(&fonts::Font0); display.setTextColor(kUiMuted, kUiSurface);
+  display.setCursor(168, 92); display.print("Z X C/V");
 
-  display.fillRect(0, 80, 240, 28, 0x0208);
-  display.setTextColor(TFT_GREENYELLOW, 0x0208);
-  display.setCursor(4, 81); display.printf("%s 燈具  Z電源  X白/黃  C− / V＋", resultIcon(lastDeviceResult[2]));
-  display.setTextColor(TFT_WHITE, 0x0208);
-  display.setCursor(4, 94);
-  display.printf("%u/%u在線  %s  %u%%  %uK", light.onlineDevices, light.totalDevices,
-                 light.mixed ? "MIX" : (light.power ? "ON" : "OFF"), light.brightness,
-                 light.colorTemperature);
-
-  display.setTextColor(feedbackColor, TFT_BLACK);
-  display.setCursor(4, 109); display.print(lastFeedback);
-  display.fillRect(0, 120, 240, 15, TFT_NAVY);
-  display.setTextColor(TFT_WHITE, TFT_NAVY);
-  display.setCursor(3, 121); display.print("TAB詳細頁   0快捷頁");
+  drawFooter("TAB DETAILS  ·  I STATUS");
   display.pushSprite(0, 0);
 }
 
 void drawDysonAirPage(const DysonState& dyson, const AdapterHealth& health) {
   auto& display = uiCanvas;
-  display.fillScreen(TFT_BLACK);
-  drawHeader("Dyson 空氣品質", health.connection);
-  display.setFont(&fonts::efontTW_10);
-  display.setTextColor(TFT_WHITE, TFT_BLACK);
-  display.setCursor(4, 25); display.printf("溫度 %.1f°C   濕度 %u%%", dyson.temperatureC, dyson.humidity);
-  display.setCursor(4, 40); display.printf("PM2.5 %u   PM10 %u", dyson.pm25, dyson.pm10);
-  display.setCursor(4, 55); display.printf("VOC %u   NO₂ %u   甲醛 %u", dyson.voc, dyson.no2, dyson.formaldehyde);
-  display.setCursor(4, 70); display.printf("活性碳 %d%%   HEPA %d%%", dyson.carbonFilter, dyson.hepaFilter);
-  display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-  display.setCursor(4, 88);
-  if (dyson.lastReportMs)
-    display.printf("資料更新 %lu 秒前", static_cast<unsigned long>(elapsedSince(millis(), dyson.lastReportMs) / 1000));
-  else
-    display.print("尚未收到感測資料");
-  display.setTextColor(feedbackColor, TFT_BLACK); display.setCursor(4, 106); display.print(lastFeedback);
-  display.fillRect(0, 120, 240, 15, TFT_NAVY);
-  display.setTextColor(TFT_WHITE, TFT_NAVY); display.setCursor(3, 121); display.print("4空氣品質  TAB下一頁  0快捷頁");
+  display.fillScreen(kUiBackground);
+  drawHeader("AIR  空氣品質", health.connection);
+  const struct Metric { int x; int y; const char* label; String value; uint16_t color; } metrics[] = {
+    {3, 25, "溫度", String(dyson.temperatureC, 1) + "°C", kUiCyan},
+    {82, 25, "濕度", String(dyson.humidity) + "%", kUiBlue},
+    {161, 25, "PM2.5", String(dyson.pm25), kUiGreen},
+    {3, 66, "PM10", String(dyson.pm10), kUiGreen},
+    {82, 66, "VOC / NO₂", String(dyson.voc) + " / " + String(dyson.no2), kUiAmber},
+    {161, 66, "甲醛", String(dyson.formaldehyde), kUiAmber},
+  };
+  for (const auto& metric : metrics) {
+    drawCard(metric.x, metric.y, 75, 37, metric.color);
+    display.setFont(&fonts::Font0); display.setTextColor(kUiMuted, kUiSurface);
+    display.setCursor(metric.x + 7, metric.y + 5); display.print(metric.label);
+    if (metric.value.length() > 8) display.setFont(&fonts::Font0);
+    else display.setFont(&fonts::efontTW_12_b);
+    display.setTextColor(TFT_WHITE, kUiSurface);
+    display.setCursor(metric.x + 7, metric.y + 18); display.print(metric.value);
+  }
+  display.setFont(&fonts::Font0); display.setTextColor(kUiMuted, kUiBackground); display.setCursor(6, 103);
+  display.printf("FILTER C %d%%  H %d%%  ·  %lus", dyson.carbonFilter, dyson.hepaFilter,
+                 dyson.lastReportMs ? static_cast<unsigned long>(elapsedSince(millis(), dyson.lastReportMs) / 1000) : 0UL);
+  drawFooter("4 AIR  ·  0 HOME");
   display.pushSprite(0, 0);
 }
 
 void drawDiagnosticsPage(const AdapterHealth& dyson, const AdapterHealth& light, const SystemState& system) {
   auto& display = uiCanvas;
-  display.fillScreen(TFT_BLACK);
-  drawHeader("系統診斷", system.wifiConnected ? ConnectionState::Online : ConnectionState::Offline);
+  display.fillScreen(kUiBackground);
+  drawHeader("STATUS  系統診斷", system.wifiConnected ? ConnectionState::Online : ConnectionState::Offline);
+  drawCard(3, 25, 114, 37, kUiBlue);
+  drawCard(122, 25, 115, 37, kUiGreen);
+  drawCard(3, 66, 114, 37, kUiAmber);
+  drawCard(122, 66, 115, 37, kUiCyan);
+  display.setFont(&fonts::Font0); display.setTextColor(kUiMuted, kUiSurface);
+  display.setCursor(10, 30); display.printf("NETWORK %ddBm", system.rssi);
+  display.setCursor(129, 30); display.printf("POWER %s", uiRuntime.dimmed ? "SAVE" : "ACTIVE");
+  display.setCursor(10, 71); display.print("DEVICES");
+  display.setCursor(129, 71); display.print("MEMORY");
+  display.setFont(&fonts::Font0); display.setTextColor(TFT_WHITE, kUiSurface);
+  display.setCursor(10, 45); display.print(system.ip);
   display.setFont(&fonts::efontTW_10);
-  display.setTextColor(TFT_WHITE, TFT_BLACK);
-  display.setCursor(4, 24); display.printf("版本 %s  Uptime %lus", kFirmwareVersion,
-                                         static_cast<unsigned long>(millis() / 1000));
-  display.setCursor(4, 38); display.printf("Wi-Fi %ddBm  IP %s", system.rssi, system.ip);
-  display.setCursor(4, 52); display.printf("Heap %u  最低 %u", ESP.getFreeHeap(), ESP.getMinFreeHeap());
-  display.setCursor(4, 66); display.printf("Dyson %s  最後 %lus", connectionText(dyson.connection),
-                                         dyson.lastSuccessMs ? static_cast<unsigned long>(elapsedSince(millis(), dyson.lastSuccessMs) / 1000) : 0UL);
-  display.setCursor(4, 80); display.printf("燈具 %u/%u  %s", light.onlineTargets, light.totalTargets,
-                                         connectionText(light.connection));
-  display.setTextColor(TFT_ORANGE, TFT_BLACK);
-  display.setCursor(4, 94);
+  display.setCursor(129, 43);
+  if (uiRuntime.batteryLevel >= 0) display.printf("%ld%% ", static_cast<long>(uiRuntime.batteryLevel));
+  else display.print("--% ");
+  display.printf("%s · IMU %s", uiRuntime.charging ? "充電" : "電池", uiRuntime.imuAvailable ? "ON" : "OFF");
+  display.setCursor(10, 84); display.printf("D:%s  L:%u/%u", connectionText(dyson.connection),
+                                           light.onlineTargets, light.totalTargets);
+  display.setCursor(129, 84); display.printf("%u / %u", ESP.getFreeHeap(), ESP.getMinFreeHeap());
+  display.setFont(&fonts::Font0); display.setTextColor(kUiMuted, kUiBackground); display.setCursor(5, 103);
+  display.printf("%s · UP %lus · IR %lu/%lums", kFirmwareVersion,
+                 static_cast<unsigned long>(millis() / 1000),
+                 static_cast<unsigned long>(system.lastIrLatencyMs),
+                 static_cast<unsigned long>(system.maxIrLatencyMs));
   const char* error = dyson.lastError[0] ? dyson.lastError : light.lastError[0] ? light.lastError : "無錯誤";
-  display.printf("最近錯誤: %.30s", error);
-  display.fillRect(0, 120, 240, 15, TFT_NAVY);
-  display.setTextColor(TFT_WHITE, TFT_NAVY); display.setCursor(3, 121); display.print("I診斷  TAB下一頁  0快捷頁");
+  if (error[0] && strcmp(error, "無錯誤") != 0) {
+    display.fillRect(3, 101, 234, 10, kUiBackground);
+    display.setTextColor(kUiRed, kUiBackground); display.setCursor(5, 103); display.printf("ERR %.32s", error);
+  }
+  drawFooter("I STATUS  ·  0 HOME");
   display.pushSprite(0, 0);
 }
 
@@ -309,23 +448,25 @@ void drawUi() {
     return;
   }
   auto& display = uiCanvas;
-  display.fillScreen(TFT_BLACK);
+  display.fillScreen(kUiBackground);
   const char* title = selectedDevice == DeviceId::Ac ? "冷氣 RG57A" :
                       selectedDevice == DeviceId::Dyson ? "Dyson TP09" : "所有 Tapo 燈";
   const ConnectionState connection = selectedDevice == DeviceId::Ac ? acHealth.connection :
                                      selectedDevice == DeviceId::Dyson ? dysonHealth.connection : lightHealth.connection;
   drawHeader(title, connection);
   display.setFont(&fonts::efontTW_10);
-  display.setTextColor(TFT_LIGHTGREY, TFT_BLACK); display.setCursor(4, 23);
+  drawCard(3, 25, 234, 16, selectedDevice == DeviceId::Ac ? kUiCyan :
+           selectedDevice == DeviceId::Dyson ? kUiAmber : kUiGreen);
+  display.setTextColor(kUiMuted, kUiSurface); display.setCursor(9, 27);
   if (selectedDevice == DeviceId::Ac)
-    display.printf("紅外線推定狀態｜%u°C", ac.temperature);
+    display.printf("IR 推定狀態  ·  %s  %u°C", ac.power ? "ON" : "OFF", ac.temperature);
   else if (selectedDevice == DeviceId::Dyson)
-    display.printf("%.1f°C  %u%%  PM2.5 %u  PM10 %u", dyson.temperatureC, dyson.humidity, dyson.pm25, dyson.pm10);
+    display.printf("%.1f°C  ·  %u%%  ·  PM2.5 %u", dyson.temperatureC, dyson.humidity, dyson.pm25);
   else
-    display.printf("自動探索 %u/%u 在線%s", light.onlineDevices, light.totalDevices, light.mixed ? "｜狀態不一致" : "");
+    display.printf("%u/%u在線 · %u開啟 %s", light.onlineDevices, light.totalDevices,
+                   light.poweredOnDevices, mixedLightText(light).c_str());
   if (selectedDevice == DeviceId::Light) {
-    display.fillRect(209, 23, 27, 10, lightPreviewColor(light));
-    display.drawRect(208, 22, 29, 12, TFT_LIGHTGREY);
+    display.fillRoundRect(212, 28, 20, 9, 2, lightPreviewColor(light));
   }
 
   const uint8_t current = selectedItem[deviceIndex(selectedDevice)];
@@ -334,18 +475,18 @@ void drawUi() {
   display.setFont(&fonts::efontTW_12);
   for (uint8_t row = 0; row < 4 && first + row < count; ++row) {
     const uint8_t item = first + row;
-    const int y = 37 + row * 17;
+    const int y = 44 + row * 16;
     const bool selected = item == current;
-    display.fillRect(2, y, 236, 16, selected ? TFT_DARKCYAN : TFT_BLACK);
-    display.setTextColor(selected ? TFT_WHITE : TFT_LIGHTGREY, selected ? TFT_DARKCYAN : TFT_BLACK);
-    display.setCursor(5, y + 1); display.print(selected ? "▶ " : "  "); display.print(itemLabel(selectedDevice, item));
+    const uint16_t accent = selectedDevice == DeviceId::Ac ? kUiCyan : selectedDevice == DeviceId::Dyson ? kUiAmber : kUiGreen;
+    display.fillRoundRect(3, y, 234, 14, 3, selected ? kUiRaised : kUiBackground);
+    if (selected) display.fillRoundRect(4, y + 2, 3, 10, 1, accent);
+    display.setTextColor(selected ? TFT_WHITE : kUiMuted, selected ? kUiRaised : kUiBackground);
+    display.setCursor(10, y); display.print(itemLabel(selectedDevice, item));
     const String value = itemValue(selectedDevice, item, ac, dyson, light);
-    display.setCursor(234 - display.textWidth(value), y + 1); display.print(value);
+    display.setTextColor(selected ? accent : TFT_WHITE, selected ? kUiRaised : kUiBackground);
+    display.setCursor(232 - display.textWidth(value), y); display.print(value);
   }
-  display.setFont(&fonts::efontTW_10);
-  display.setTextColor(feedbackColor, TFT_BLACK); display.setCursor(4, 106); display.print(lastFeedback);
-  display.setTextColor(TFT_WHITE, TFT_NAVY); display.fillRect(0, 120, 240, 15, TFT_NAVY);
-  display.setCursor(3, 121); display.print("TAB設備  W/S選擇  A/D調整  ENTER套用");
+  drawFooter("W/S SELECT  ·  A/D CHANGE  ·  ENTER");
   display.pushSprite(0, 0);
 }
 
@@ -442,7 +583,7 @@ void activateSelected() {
     else adjustSelected(1);
   } else {
     if (item == 0) enqueue(DeviceId::Light, CommandKind::SetPower,
-                           light.mixed ? 1 : !effectiveValue(DeviceId::Light, CommandKind::SetPower, light.power));
+                           effectiveLightGroupPowerTarget(light));
     else adjustSelected(1);
   }
 }
@@ -471,7 +612,11 @@ void handleQuickKey(char key) {
                 effectiveValue(DeviceId::Dyson, CommandKind::SetOscillationAngles, dyson.angleLow) + 15,
                 effectiveValue(DeviceId::Dyson, CommandKind::SetOscillationAngles, dyson.angleHigh, 2) + 15);
       break;
-    case 'z': enqueue(DeviceId::Light, CommandKind::SetPower, light.mixed ? 1 : !effectiveValue(DeviceId::Light, CommandKind::SetPower, light.power)); break;
+    case 'z': {
+      enqueue(DeviceId::Light, CommandKind::SetPower,
+              effectiveLightGroupPowerTarget(light));
+      break;
+    }
     case 'x': enqueue(DeviceId::Light, CommandKind::SetColorTemperature,
                       effectiveValue(DeviceId::Light, CommandKind::SetColorTemperature, light.colorTemperature) >= 4500 ? 2700 : 6500); break;
     case 'c': enqueue(DeviceId::Light, CommandKind::SetBrightness,
@@ -482,9 +627,62 @@ void handleQuickKey(char key) {
   }
 }
 
+void wakeDisplay(uint32_t now, const char* source) {
+  const bool wasPowerSaving = uiRuntime.sleeping || uiRuntime.dimmed;
+  if (uiRuntime.sleeping) M5Cardputer.Display.wakeup();
+  M5Cardputer.Display.setBrightness(kNormalBrightness);
+  uiRuntime.sleeping = false;
+  uiRuntime.dimmed = false;
+  uiRuntime.lastActivityMs = now;
+  uiRuntime.forceRedraw = true;
+  if (wasPowerSaving) Serial.printf("ui power=awake source=%s\n", source);
+}
+
+void tickUiPower(uint32_t now) {
+  if (!uiRuntime.nextBatterySampleMs || deadlineReached(now, uiRuntime.nextBatterySampleMs)) {
+    const int32_t level = M5.Power.getBatteryLevel();
+    uiRuntime.batteryLevel = level < 0 ? -1 : constrain(level, 0L, 100L);
+    uiRuntime.charging = M5.Power.isCharging() == m5::Power_Class::is_charging;
+    uiRuntime.nextBatterySampleMs = now + 5000;
+  }
+
+  if (uiRuntime.imuAvailable &&
+      (!uiRuntime.nextMotionSampleMs || deadlineReached(now, uiRuntime.nextMotionSampleMs))) {
+    float ax = 0, ay = 0, az = 0, gx = 0, gy = 0, gz = 0;
+    if (M5.Imu.getAccel(&ax, &ay, &az) && M5.Imu.getGyro(&gx, &gy, &gz)) {
+      if (uiRuntime.haveMotionSample &&
+          motionDetected(ax, ay, az, uiRuntime.lastAx, uiRuntime.lastAy, uiRuntime.lastAz, gx, gy, gz))
+        wakeDisplay(now, "motion");
+      uiRuntime.lastAx = ax;
+      uiRuntime.lastAy = ay;
+      uiRuntime.lastAz = az;
+      uiRuntime.haveMotionSample = true;
+    }
+    uiRuntime.nextMotionSampleMs = now + 100;
+  }
+
+  const ScreenPowerMode mode = screenPowerMode(now, uiRuntime.lastActivityMs, kDimAfterMs, kSleepAfterMs);
+  if (mode == ScreenPowerMode::Sleeping && !uiRuntime.sleeping) {
+    M5Cardputer.Display.sleep();
+    uiRuntime.sleeping = true;
+    uiRuntime.dimmed = true;
+    Serial.println("ui power=sleeping");
+  } else if (mode == ScreenPowerMode::Dimmed && !uiRuntime.dimmed) {
+    M5Cardputer.Display.setBrightness(kDimBrightness);
+    uiRuntime.dimmed = true;
+    uiRuntime.forceRedraw = true;
+    Serial.println("ui power=dimmed");
+  }
+}
+
 void handleKeys() {
   M5Cardputer.update();
   if (!M5Cardputer.Keyboard.isChange() || !M5Cardputer.Keyboard.isPressed()) return;
+  if (uiRuntime.sleeping || uiRuntime.dimmed) {
+    wakeDisplay(millis(), "keyboard");
+    return;
+  }
+  uiRuntime.lastActivityMs = millis();
   const auto keys = M5Cardputer.Keyboard.keysState();
   if (keys.tab) {
     currentPage = static_cast<UiPage>((static_cast<uint8_t>(currentPage) + 1) % 6);
@@ -521,7 +719,7 @@ void handleKeys() {
           selectedDevice == DeviceId::Dyson ? effectiveValue(DeviceId::Dyson, CommandKind::SetPower, dyson.power) :
           effectiveValue(DeviceId::Light, CommandKind::SetPower, light.power);
       enqueue(selectedDevice, CommandKind::SetPower,
-              selectedDevice == DeviceId::Light && light.mixed ? 1 : !current);
+              selectedDevice == DeviceId::Light ? effectiveLightGroupPowerTarget(light) : !current);
     }
   }
 }
@@ -529,6 +727,8 @@ void handleKeys() {
 void uiTask(void*) {
   uint32_t nextDraw = 0;
   for (;;) {
+    const uint32_t now = millis();
+    tickUiPower(now);
     handleKeys();
     DeviceEvent event;
     while (xQueueReceive(eventQueue, &event, 0) == pdTRUE) {
@@ -548,7 +748,11 @@ void uiTask(void*) {
       feedbackColor = event.result == EventResult::Succeeded ? TFT_GREEN :
                       (event.result == EventResult::Pending || event.result == EventResult::PartiallySucceeded) ? TFT_YELLOW : TFT_RED;
     }
-    if (millis() >= nextDraw) { drawUi(); nextDraw = millis() + 250; }
+    if (!uiRuntime.sleeping && (uiRuntime.forceRedraw || !nextDraw || deadlineReached(now, nextDraw))) {
+      drawUi();
+      uiRuntime.forceRedraw = false;
+      nextDraw = now + 250;
+    }
     vTaskDelay(pdMS_TO_TICKS(20));
   }
 }
@@ -566,6 +770,7 @@ SetupValidationResult setupValidation(bool ok, SetupValidationStage stage, const
   result.ok = ok;
   result.stage = stage;
   strncpy(result.detail, detail ? detail : "", sizeof(result.detail) - 1);
+  result.detail[sizeof(result.detail) - 1] = '\0';
   return result;
 }
 
@@ -595,10 +800,11 @@ SetupValidationResult validateSetupCandidate(const AppConfig& candidate) {
 
 bool isTerminal(EventResult result) { return result != EventResult::Pending; }
 
-void forwardNetworkEvent(const DeviceEvent& event) {
+void forwardAdapterEvent(const DeviceEvent& event) {
   if (isTerminal(event.result)) {
     xSemaphoreTake(commandMutex, portMAX_DELAY);
-    commandDispatcher.complete(event.commandId);
+    if (event.device == DeviceId::Ac) irCommandDispatcher.complete(event.commandId);
+    else networkCommandDispatcher.complete(event.commandId);
     xSemaphoreGive(commandMutex);
   }
   xQueueSend(eventQueue, &event, 0);
@@ -606,11 +812,51 @@ void forwardNetworkEvent(const DeviceEvent& event) {
 
 void drainAdapterEvents(DeviceAdapter& adapter) {
   DeviceEvent event;
-  while (adapter.pollEvent(event)) forwardNetworkEvent(event);
+  while (adapter.pollEvent(event)) forwardAdapterEvent(event);
+}
+
+void irTask(void*) {
+  irAdapter.begin(appConfig);
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  sharedAc = irAdapter.snapshot();
+  sharedAcHealth = irAdapter.health();
+  xSemaphoreGive(stateMutex);
+
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
+    DeviceCommand command;
+    for (;;) {
+      xSemaphoreTake(commandMutex, portMAX_DELAY);
+      const bool haveCommand = irCommandDispatcher.take(command);
+      xSemaphoreGive(commandMutex);
+      if (!haveCommand) break;
+
+      const uint32_t dispatchMs = millis();
+      const uint32_t latencyMs = command.queuedAtMs ? elapsedSince(dispatchMs, command.queuedAtMs) : 0;
+      const uint32_t previousSendMs = irAdapter.snapshot().lastSentMs;
+      const DeviceEvent event = irAdapter.execute(command);
+      Serial.printf("ir dispatch id=%lu latency_ms=%lu target_ms=%lu%s\n",
+                    static_cast<unsigned long>(command.id), static_cast<unsigned long>(latencyMs),
+                    static_cast<unsigned long>(kIrLatencyTargetMs),
+                    latencyMs <= kIrLatencyTargetMs ? "" : " WARNING");
+      forwardAdapterEvent(event);
+      drainAdapterEvents(irAdapter);
+
+      xSemaphoreTake(stateMutex, portMAX_DELAY);
+      sharedAc = irAdapter.snapshot();
+      sharedAcHealth = irAdapter.health();
+      sharedSystem.lastIrLatencyMs = latencyMs;
+      sharedSystem.maxIrLatencyMs = max(sharedSystem.maxIrLatencyMs, latencyMs);
+      if (sharedAc.lastSentMs != previousSendMs) {
+        ++acStateRevision;
+        acSaveDueMs = millis() + 5000;
+      }
+      xSemaphoreGive(stateMutex);
+    }
+  }
 }
 
 void networkTask(void*) {
-  irAdapter.begin(appConfig);
   WiFi.mode(WIFI_STA);
   WiFi.begin(appConfig.wifi.ssid.c_str(), appConfig.wifi.password.c_str());
   uint32_t nextWifiAttemptMs = millis() + 1000;
@@ -618,9 +864,7 @@ void networkTask(void*) {
   bool lanStarted = false;
   bool wasConnected = false;
   IPAddress lastIp;
-  uint32_t observedAcSendMs = irAdapter.snapshot().lastSentMs;
-  uint32_t acSaveDueMs = 0;
-  bool acSavePending = false;
+  uint32_t persistedAcRevision = 0;
   for (;;) {
     const uint32_t now = millis();
     const bool connected = WiFi.status() == WL_CONNECTED;
@@ -641,33 +885,32 @@ void networkTask(void*) {
       dysonAdapter.tick(now);
       tapoAdapter.tick(now);
     }
-    irAdapter.tick(now);
     DeviceCommand command;
     xSemaphoreTake(commandMutex, portMAX_DELAY);
-    const bool haveCommand = commandDispatcher.take(command);
+    const bool haveCommand = networkCommandDispatcher.take(command);
     xSemaphoreGive(commandMutex);
     if (haveCommand) {
-      DeviceEvent event;
-      if (command.device == DeviceId::Ac) event = irAdapter.execute(command);
-      else if (command.device == DeviceId::Dyson) event = dysonAdapter.execute(command);
-      else event = tapoAdapter.execute(command);
-      forwardNetworkEvent(event);
+      const DeviceEvent event = command.device == DeviceId::Dyson ? dysonAdapter.execute(command) :
+                                                                    tapoAdapter.execute(command);
+      forwardAdapterEvent(event);
     }
-    drainAdapterEvents(irAdapter);
     drainAdapterEvents(dysonAdapter);
     drainAdapterEvents(tapoAdapter);
-    if (irAdapter.snapshot().lastSentMs != observedAcSendMs) {
-      observedAcSendMs = irAdapter.snapshot().lastSentMs;
-      acSaveDueMs = now + 5000;
-      acSavePending = true;
-    }
-    if (acSavePending && deadlineReached(now, acSaveDueMs)) {
-      if (configStore.saveAcState(irAdapter.snapshot())) acSavePending = false;
-      else acSaveDueMs = now + 5000;
+
+    AcState acToPersist;
+    uint32_t revision = 0;
+    uint32_t saveDue = 0;
+    xSemaphoreTake(stateMutex, portMAX_DELAY);
+    acToPersist = sharedAc;
+    revision = acStateRevision;
+    saveDue = acSaveDueMs;
+    xSemaphoreGive(stateMutex);
+    if (revision != persistedAcRevision && deadlineReached(now, saveDue)) {
+      if (configStore.saveAcState(acToPersist)) persistedAcRevision = revision;
     }
     xSemaphoreTake(stateMutex, portMAX_DELAY);
-    sharedAc = irAdapter.snapshot(); sharedDyson = dysonAdapter.snapshot(); sharedLight = tapoAdapter.snapshot();
-    sharedAcHealth = irAdapter.health(); sharedDysonHealth = dysonAdapter.health(); sharedLightHealth = tapoAdapter.health();
+    sharedDyson = dysonAdapter.snapshot(); sharedLight = tapoAdapter.snapshot();
+    sharedDysonHealth = dysonAdapter.health(); sharedLightHealth = tapoAdapter.health();
     sharedSystem.wifiConnected = connected;
     sharedSystem.rssi = connected ? WiFi.RSSI() : 0;
     strncpy(sharedSystem.ip, connected ? WiFi.localIP().toString().c_str() : "0.0.0.0", sizeof(sharedSystem.ip) - 1);
@@ -693,8 +936,13 @@ bool bootSetupRequested() {
 void setup() {
   Serial.begin(115200);
   auto cfg = M5.config();
+  cfg.internal_imu = true;
   M5Cardputer.begin(cfg, true);
   M5Cardputer.Display.setRotation(1);
+  M5Cardputer.Display.setBrightness(kNormalBrightness);
+  uiRuntime.imuAvailable = M5.Imu.isEnabled();
+  uiRuntime.lastActivityMs = millis();
+  Serial.printf("ui imu=%s\n", uiRuntime.imuAvailable ? "enabled" : "unavailable");
   M5Cardputer.Display.setFont(&fonts::efontTW_12);
   M5Cardputer.Display.fillScreen(TFT_BLACK);
   M5Cardputer.Display.setTextColor(TFT_WHITE, TFT_BLACK);
@@ -719,6 +967,7 @@ void setup() {
   uiCanvas.setColorDepth(8);
   uiCanvas.createSprite(240, 135);
   uiCanvas.setTextWrap(false);
+  xTaskCreatePinnedToCore(irTask, "ir", 4096, nullptr, 3, &irTaskHandle, 1);
   xTaskCreatePinnedToCore(uiTask, "ui", 6144, nullptr, 2, nullptr, 1);
   xTaskCreatePinnedToCore(networkTask, "network", 12288, nullptr, 2, nullptr, 0);
 }

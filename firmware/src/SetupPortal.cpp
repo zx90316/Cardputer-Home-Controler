@@ -29,7 +29,7 @@ bool SetupPortal::begin(ConfigStore& store, AppConfig& config, Validator validat
   if (!WiFi.softAP("Cardputer-Home-Setup", apPassword_.c_str())) return false;
   server_.on("/", HTTP_GET, [this] { handleRoot(); });
   server_.on("/save", HTTP_POST, [this] { handleSave(); });
-  server_.onNotFound([this] { server_.sendHeader("Location", "/"); server_.send(302); });
+  server_.onNotFound([this] { noStore(); server_.sendHeader("Location", "/"); server_.send(302); });
   server_.begin();
   startedMs_ = millis();
   active_ = true;

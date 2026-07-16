@@ -44,4 +44,15 @@ inline uint8_t clampPercent(int32_t value) {
   return static_cast<uint8_t>(value);
 }
 
+inline bool lightGroupPowerTarget(const LightState& state) {
+  // A mixed group must be switchable off in one press. Only a completely-off
+  // group uses the next power action to switch every lamp on.
+  return state.poweredOnDevices == 0;
+}
+
+inline bool nextLightGroupPowerTarget(const LightState& state, bool hasPendingTarget,
+                                      bool pendingTarget) {
+  return hasPendingTarget ? !pendingTarget : lightGroupPowerTarget(state);
+}
+
 }  // namespace chc
