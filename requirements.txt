@@ -1,5 +1,5 @@
 python-kasa==0.10.2
-libdyson-rest==0.15.0
+libdyson-rest==0.16.0
 paho-mqtt==2.1.0
 pytest==8.4.1
 zeroconf==0.150.0
