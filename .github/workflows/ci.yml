@@ -60,7 +60,7 @@ jobs:
         run: powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\scripts\build-firmware.ps1
 
       - name: Upload reproducible firmware artifacts
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: cardputer-home-controller-${{ github.sha }}
           path: |
