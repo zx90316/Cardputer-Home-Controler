@@ -1,4 +1,4 @@
-python-kasa==0.10.2
+python-kasa==0.11.0.1
 libdyson-rest==0.16.1
 paho-mqtt==2.1.0
 zeroconf==0.151.3
