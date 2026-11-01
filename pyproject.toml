@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "LAN capability probe for Tapo L530E and Dyson TP09"
 requires-python = ">=3.11"
 dependencies = [
-  "python-kasa==0.10.2",
+  "python-kasa==0.12.0",
   "libdyson-rest==0.16.1",
   "paho-mqtt==2.1.0",
   "zeroconf==0.151.3",
